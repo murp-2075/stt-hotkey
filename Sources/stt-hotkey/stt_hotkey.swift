@@ -55,7 +55,7 @@ private final class HotkeyManager {
     var onHotkey: (() -> Void)?
 
     func register(hotkey: HotkeyConfig) -> Bool {
-        hotKeyID = EventHotKeyID(signature: fourCharCode("ssth"), id: 1)
+        hotKeyID = EventHotKeyID(signature: fourCharCode("stth"), id: 1)
         let status = RegisterEventHotKey(hotkey.keyCode, hotkey.modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
         if status != noErr {
             return false
@@ -112,7 +112,7 @@ private final class AudioRecorder: NSObject, AVAudioRecorderDelegate, @unchecked
 
     func start() throws -> URL {
         let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("sst-hotkey-\(Int(Date().timeIntervalSince1970)).wav")
+            .appendingPathComponent("stt-hotkey-\(Int(Date().timeIntervalSince1970)).wav")
 
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
@@ -299,7 +299,7 @@ final class AppMain: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        log("sst-hotkey: launched")
+        log("stt-hotkey: launched")
         cleanupStaleTempFiles()
         setupStatusItem()
         setupHotkey()
@@ -326,10 +326,10 @@ final class AppMain: NSObject, NSApplicationDelegate {
         guard let entries = try? FileManager.default.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: nil) else {
             return
         }
-        for url in entries where url.lastPathComponent.hasPrefix("sst-hotkey-") && url.pathExtension == "wav" {
+        for url in entries where url.lastPathComponent.hasPrefix("stt-hotkey-") && url.pathExtension == "wav" {
             try? FileManager.default.removeItem(at: url)
         }
-        log("sst-hotkey: cleaned temp wav files")
+        log("stt-hotkey: cleaned temp wav files")
     }
 
     private func setupStatusItem() {
@@ -356,10 +356,10 @@ final class AppMain: NSObject, NSApplicationDelegate {
         }
         let ok = hotkeyManager.register(hotkey: config)
         if !ok {
-            log("sst-hotkey: failed to register hotkey")
+            log("stt-hotkey: failed to register hotkey")
             showAlert(title: "Hotkey Error", message: "Failed to register global hotkey.")
         } else {
-            log("sst-hotkey: hotkey registered")
+            log("stt-hotkey: hotkey registered")
         }
     }
 
@@ -385,7 +385,7 @@ final class AppMain: NSObject, NSApplicationDelegate {
                 if granted {
                     self.startRecording()
                 } else {
-                    log("sst-hotkey: microphone permission denied")
+                    log("stt-hotkey: microphone permission denied")
                     self.showAlert(title: "Microphone Permission", message: "Microphone access is required to record audio.")
                 }
             }
@@ -400,16 +400,16 @@ final class AppMain: NSObject, NSApplicationDelegate {
         do {
             _ = try recorder.start()
             state = .recording
-            log("sst-hotkey: recording started")
+            log("stt-hotkey: recording started")
         } catch {
-            log("sst-hotkey: recording error - \(error.localizedDescription)")
+            log("stt-hotkey: recording error - \(error.localizedDescription)")
             showAlert(title: "Recording Error", message: error.localizedDescription)
         }
     }
 
     private func stopRecordingAndTranscribe() {
         recorder.stop()
-        log("sst-hotkey: recording stopped")
+        log("stt-hotkey: recording stopped")
         guard let fileURL = recorder.fileURL else {
             showAlert(title: "Recording Error", message: "No recording file found.")
             state = .idle
@@ -432,12 +432,12 @@ final class AppMain: NSObject, NSApplicationDelegate {
             self.state = .idle
             switch result {
             case .success(let text):
-                log("sst-hotkey: transcription success")
+                log("stt-hotkey: transcription success")
                 self.copyToClipboard(text)
                 self.playDing()
                 self.blinkIcon()
             case .failure(let error):
-                log("sst-hotkey: transcription error - \(error.localizedDescription)")
+                log("stt-hotkey: transcription error - \(error.localizedDescription)")
                 self.showAlert(title: "Transcription Error", message: error.localizedDescription)
             }
             try? FileManager.default.removeItem(at: fileURL)

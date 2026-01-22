@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>sst-hotkey</string>
+    <string>stt-hotkey</string>
     <key>CFBundleDisplayName</key>
-    <string>sst-hotkey</string>
+    <string>stt-hotkey</string>
     <key>CFBundleIdentifier</key>
-    <string>com.local.sst-hotkey</string>
+    <string>com.local.stt-hotkey</string>
     <key>CFBundleExecutable</key>
     <string>stt-hotkey</string>
     <key>CFBundlePackageType</key>
@@ -19,7 +19,7 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>sst-hotkey needs microphone access to transcribe your speech.</string>
+    <string>stt-hotkey needs microphone access to transcribe your speech.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

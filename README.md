@@ -1,4 +1,4 @@
-# sst-hotkey
+# stt-hotkey
 
 Build
 ```
@@ -13,12 +13,12 @@ EOF
 
 Run
 ```
-open ./build/sst-hotkey.app
+open ./build/stt-hotkey.app
 ```
 
 Deploy
 ```
-rm -rf /Applications/sst-hotkey.app
-cp -R ./build/sst-hotkey.app /Applications/
-open /Applications/sst-hotkey.app
+rm -rf /Applications/stt-hotkey.app
+cp -R ./build/stt-hotkey.app /Applications/
+open /Applications/stt-hotkey.app
 ```
