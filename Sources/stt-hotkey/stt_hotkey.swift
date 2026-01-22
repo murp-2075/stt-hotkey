@@ -1,10 +1,12 @@
 import AppKit
+import AudioToolbox
 import AVFoundation
 import Carbon
 import Foundation
 
 private enum AppState {
     case idle
+    case starting
     case recording
     case transcribing
 }
@@ -106,33 +108,56 @@ private final class HotkeyManager {
     }
 }
 
-private final class AudioRecorder: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
-    private var recorder: AVAudioRecorder?
+private final class AudioRecorder: NSObject, @unchecked Sendable {
+    private let engine = AVAudioEngine()
+    private var file: AVAudioFile?
+    private var didFireStart = false
+    private var onFirstBuffer: (() -> Void)?
     private(set) var fileURL: URL?
 
-    func start() throws -> URL {
+    func start(onFirstBuffer: @escaping () -> Void) throws -> URL {
+        stop()
+        didFireStart = false
+        self.onFirstBuffer = onFirstBuffer
+
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("stt-hotkey-\(Int(Date().timeIntervalSince1970)).wav")
 
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: 16000.0,
-            AVNumberOfChannelsKey: 1,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false
-        ]
+        let input = engine.inputNode
+        let inputFormat = input.inputFormat(forBus: 0)
+        guard inputFormat.channelCount > 0 else {
+            throw NSError(domain: "AudioRecorder", code: 2, userInfo: [NSLocalizedDescriptionKey: "No input channels available."])
+        }
 
-        recorder = try AVAudioRecorder(url: tempURL, settings: settings)
-        recorder?.delegate = self
-        recorder?.prepareToRecord()
-        recorder?.record()
+        file = try AVAudioFile(forWriting: tempURL, settings: inputFormat.settings)
         fileURL = tempURL
+
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+            guard let self else { return }
+
+            if !self.didFireStart {
+                self.didFireStart = true
+                let onFirst = self.onFirstBuffer
+                DispatchQueue.main.async {
+                    onFirst?()
+                }
+            }
+
+            try? self.file?.write(from: buffer)
+        }
+
+        engine.prepare()
+        try engine.start()
         return tempURL
     }
 
     func stop() {
-        recorder?.stop()
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        file = nil
+        onFirstBuffer = nil
+        didFireStart = false
     }
 }
 
@@ -283,9 +308,12 @@ final class AppMain: NSObject, NSApplicationDelegate {
 
     private var env = Env(values: [:])
     private var apiKey: String?
+    private var startSoundID: SystemSoundID = 0
+    private var startSoundLoaded = false
     private var state: AppState = .idle {
         didSet { updateStatusIcon() }
     }
+    private var startAttempt = 0
     private var blinkTimer: Timer?
     private var blinkRemaining = 0
 
@@ -302,11 +330,15 @@ final class AppMain: NSObject, NSApplicationDelegate {
         log("stt-hotkey: launched")
         cleanupStaleTempFiles()
         setupStatusItem()
+        setupStartSound()
         setupHotkey()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         hotkeyManager.unregister()
+        if startSoundLoaded {
+            AudioServicesDisposeSystemSoundID(startSoundID)
+        }
     }
 
     private func setupEnv() {
@@ -367,6 +399,8 @@ final class AppMain: NSObject, NSApplicationDelegate {
         switch state {
         case .idle:
             requestMicPermissionAndStart()
+        case .starting:
+            cancelPendingStart()
         case .recording:
             stopRecordingAndTranscribe()
         case .transcribing:
@@ -379,31 +413,46 @@ final class AppMain: NSObject, NSApplicationDelegate {
     }
 
     private func requestMicPermissionAndStart() {
+        guard apiKey?.isEmpty == false else {
+            showAlert(title: "Missing API Key", message: "Set OPENAI_API_KEY in the .env next to the executable.")
+            return
+        }
+
+        startAttempt += 1
+        let attempt = startAttempt
+        state = .starting
+
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             DispatchQueue.main.async {
                 guard let self else { return }
+                guard attempt == self.startAttempt, self.state == .starting else { return }
                 if granted {
                     self.startRecording()
                 } else {
                     log("stt-hotkey: microphone permission denied")
                     self.showAlert(title: "Microphone Permission", message: "Microphone access is required to record audio.")
+                    self.state = .idle
                 }
             }
         }
     }
 
+    private func cancelPendingStart() {
+        startAttempt += 1
+        state = .idle
+    }
+
     private func startRecording() {
-        guard apiKey?.isEmpty == false else {
-            showAlert(title: "Missing API Key", message: "Set OPENAI_API_KEY in the .env next to the executable.")
-            return
-        }
         do {
-            _ = try recorder.start()
+            _ = try recorder.start(onFirstBuffer: { [weak self] in
+                self?.playRecordingStartDing()
+            })
             state = .recording
             log("stt-hotkey: recording started")
         } catch {
             log("stt-hotkey: recording error - \(error.localizedDescription)")
             showAlert(title: "Recording Error", message: error.localizedDescription)
+            state = .idle
         }
     }
 
@@ -448,6 +497,8 @@ final class AppMain: NSObject, NSApplicationDelegate {
         switch state {
         case .idle:
             statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "Idle")
+        case .starting:
+            statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "Starting")
         case .recording:
             statusItem.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Recording")
         case .transcribing:
@@ -488,6 +539,27 @@ final class AppMain: NSObject, NSApplicationDelegate {
     private func playDing() {
         if let sound = NSSound(named: NSSound.Name("Glass")) {
             sound.play()
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    private func setupStartSound() {
+        let soundURL = URL(fileURLWithPath: "/System/Library/Sounds/Ping.aiff")
+        var soundID: SystemSoundID = 0
+        let status = AudioServicesCreateSystemSoundID(soundURL as CFURL, &soundID)
+        if status == kAudioServicesNoError {
+            startSoundID = soundID
+            startSoundLoaded = true
+        } else {
+            log("stt-hotkey: failed to load start sound (status \(status))")
+            startSoundLoaded = false
+        }
+    }
+
+    private func playRecordingStartDing() {
+        if startSoundLoaded {
+            AudioServicesPlayAlertSound(startSoundID)
         } else {
             NSSound.beep()
         }
