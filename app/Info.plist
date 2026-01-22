@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>sst-hotkey</string>
+    <key>CFBundleDisplayName</key>
+    <string>sst-hotkey</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.local.sst-hotkey</string>
+    <key>CFBundleExecutable</key>
+    <string>stt-hotkey</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>sst-hotkey needs microphone access to transcribe your speech.</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
