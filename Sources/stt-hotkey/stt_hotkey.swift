@@ -1,5 +1,4 @@
 import AppKit
-import AudioToolbox
 import AVFoundation
 import Carbon
 import Foundation
@@ -135,16 +134,20 @@ private final class AudioRecorder: NSObject, @unchecked Sendable {
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
-
-            if !self.didFireStart {
-                self.didFireStart = true
-                let onFirst = self.onFirstBuffer
-                DispatchQueue.main.async {
-                    onFirst?()
+            if let file = self.file {
+                do {
+                    try file.write(from: buffer)
+                    if !self.didFireStart {
+                        self.didFireStart = true
+                        let onFirst = self.onFirstBuffer
+                        DispatchQueue.main.async {
+                            onFirst?()
+                        }
+                    }
+                } catch {
+                    // Ignore write errors; recorder will surface issues on stop/transcribe.
                 }
             }
-
-            try? self.file?.write(from: buffer)
         }
 
         engine.prepare()
@@ -189,6 +192,8 @@ private final class AudioStreamRecorder: NSObject, @unchecked Sendable {
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
 
+            guard let pcmData = self.convertToPCM(buffer) else { return }
+            self.onAudioData?(pcmData)
             if !self.didFireStart {
                 self.didFireStart = true
                 let onFirst = self.onFirstBuffer
@@ -196,9 +201,6 @@ private final class AudioStreamRecorder: NSObject, @unchecked Sendable {
                     onFirst?()
                 }
             }
-
-            guard let pcmData = self.convertToPCM(buffer) else { return }
-            self.onAudioData?(pcmData)
         }
 
         engine.prepare()
@@ -723,8 +725,7 @@ final class AppMain: NSObject, NSApplicationDelegate {
     private var env = Env(values: [:])
     private var apiKey: String?
     private var useRealtimeTranscription = false
-    private var startSoundID: SystemSoundID = 0
-    private var startSoundLoaded = false
+    private var startSound: NSSound?
     private var state: AppState = .idle {
         didSet { updateStatusIcon() }
     }
@@ -752,9 +753,6 @@ final class AppMain: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         hotkeyManager.unregister()
         streamTranscriber?.shutdown()
-        if startSoundLoaded {
-            AudioServicesDisposeSystemSoundID(startSoundID)
-        }
     }
 
     private func setupEnv() {
@@ -1045,20 +1043,14 @@ final class AppMain: NSObject, NSApplicationDelegate {
 
     private func setupStartSound() {
         let soundURL = URL(fileURLWithPath: "/System/Library/Sounds/Ping.aiff")
-        var soundID: SystemSoundID = 0
-        let status = AudioServicesCreateSystemSoundID(soundURL as CFURL, &soundID)
-        if status == kAudioServicesNoError {
-            startSoundID = soundID
-            startSoundLoaded = true
-        } else {
-            log("stt-hotkey: failed to load start sound (status \(status))")
-            startSoundLoaded = false
+        startSound = NSSound(contentsOf: soundURL, byReference: true) ?? NSSound(named: NSSound.Name("Ping"))
+        if startSound == nil {
+            log("stt-hotkey: failed to load start sound")
         }
     }
 
     private func playRecordingStartDing() {
-        if startSoundLoaded {
-            AudioServicesPlayAlertSound(startSoundID)
+        if let sound = startSound, sound.play() {
         } else {
             NSSound.beep()
         }
