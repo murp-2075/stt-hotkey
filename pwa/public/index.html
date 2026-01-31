@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#0f1220" />
+  <title>STT PWA</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1220;
+      --bg-deep: #090c16;
+      --panel: rgba(22, 26, 42, 0.9);
+      --panel-edge: rgba(255, 255, 255, 0.08);
+      --accent: #ff3b3b;
+      --accent-soft: #ff7a7a;
+      --ok: #35d07f;
+      --warn: #f0b64d;
+      --text: #f5f7ff;
+      --muted: rgba(245, 247, 255, 0.6);
+      --shadow: rgba(0, 0, 0, 0.35);
+      --glow: rgba(255, 59, 59, 0.35);
+      --font: "Avenir Next", "Avenir", "Futura", "Trebuchet MS", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: var(--font);
+      background: radial-gradient(circle at 20% 20%, #1f2237 0%, var(--bg) 40%, var(--bg-deep) 100%);
+      color: var(--text);
+    }
+
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: stretch;
+      padding: 24px 16px 48px;
+    }
+
+    .app {
+      width: min(920px, 100%);
+      display: grid;
+      gap: 18px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 4px 0;
+    }
+
+    header h1 {
+      font-size: 20px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-edge);
+      border-radius: 20px;
+      padding: 18px;
+      box-shadow: 0 20px 40px var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+
+    .status-row {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+
+    .status-left {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+    }
+
+    .status-icon {
+      width: 56px;
+      height: 56px;
+      border-radius: 16px;
+      display: grid;
+      place-items: center;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .status-icon svg {
+      width: 32px;
+      height: 32px;
+      display: none;
+    }
+
+    body.state-idle .icon-idle,
+    body.state-recording .icon-recording,
+    body.state-transcribing .icon-transcribing,
+    body.state-done .icon-done,
+    body.state-error .icon-error {
+      display: block;
+    }
+
+    .status-icon::after {
+      content: "";
+      position: absolute;
+      inset: -30px;
+      background: radial-gradient(circle, rgba(255, 255, 255, 0.14) 0%, transparent 70%);
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+
+    body.state-recording .status-icon::after {
+      opacity: 0.9;
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+
+    .status-text {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .status-text strong {
+      font-size: 18px;
+      letter-spacing: 0.03em;
+    }
+
+    .timer {
+      font-variant-numeric: tabular-nums;
+      color: var(--muted);
+    }
+
+    .record-btn {
+      width: 180px;
+      height: 180px;
+      border-radius: 50%;
+      border: none;
+      background: radial-gradient(circle at 30% 30%, #ff6b6b, var(--accent));
+      color: white;
+      font-size: 18px;
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      box-shadow: 0 18px 40px var(--glow);
+      cursor: pointer;
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .record-btn:active {
+      transform: scale(0.97);
+    }
+
+    body.state-recording .record-btn {
+      background: radial-gradient(circle at 30% 30%, #ff9d6b, #ff5252);
+      box-shadow: 0 16px 36px rgba(255, 130, 90, 0.4);
+    }
+
+    .record-area {
+      display: grid;
+      gap: 16px;
+      align-items: center;
+      justify-items: center;
+    }
+
+    .waveform {
+      width: 100%;
+      height: 160px;
+      border-radius: 16px;
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.01));
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 14px;
+      text-align: center;
+    }
+
+    .transcript {
+      width: 100%;
+      min-height: 160px;
+      resize: vertical;
+      background: rgba(6, 8, 16, 0.6);
+      color: var(--text);
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 12px;
+      font-family: var(--font);
+      font-size: 15px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-direction: column;
+      justify-content: flex-start;
+    }
+
+    .transcript-row {
+      display: flex;
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .transcript-row .transcript {
+      flex: 1 1 auto;
+    }
+
+    .transcript-row .actions button {
+      width: 96px;
+    }
+
+    button.secondary {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    button.secondary:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .key-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .key-row input {
+      flex: 1 1 220px;
+      background: rgba(6, 8, 16, 0.6);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      padding: 10px 12px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+    }
+
+    .muted {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .pill {
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+    }
+
+    .key-toggle {
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      cursor: pointer;
+      transition: transform 0.1s ease;
+    }
+
+    .key-toggle:active {
+      transform: scale(0.98);
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    body.state-recording .status-pill {
+      color: var(--accent-soft);
+    }
+
+    body.state-transcribing .status-pill {
+      color: var(--warn);
+    }
+
+    body.state-done .status-pill {
+      color: var(--ok);
+    }
+
+    body.state-error .status-pill {
+      color: #ff6b6b;
+    }
+
+    .spinner {
+      width: 10px;
+      height: 10px;
+      border: 2px solid rgba(255, 255, 255, 0.2);
+      border-top-color: currentColor;
+      border-radius: 50%;
+      display: inline-block;
+      animation: spin 1s linear infinite;
+      opacity: 0;
+    }
+
+    body.state-transcribing .spinner {
+      opacity: 1;
+    }
+
+    footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      padding-bottom: 16px;
+    }
+
+    @keyframes pulse {
+      0% { transform: scale(0.9); opacity: 0.6; }
+      50% { transform: scale(1.1); opacity: 1; }
+      100% { transform: scale(0.9); opacity: 0.6; }
+    }
+
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    @media (max-width: 700px) {
+      .record-btn {
+        width: 140px;
+        height: 140px;
+      }
+    }
+
+    @media (max-width: 700px), (max-height: 820px) {
+      body {
+        padding: 16px 12px 20px;
+      }
+
+      .app {
+        gap: 12px;
+      }
+
+      header h1 {
+        font-size: 16px;
+      }
+
+      .panel {
+        padding: 12px;
+        border-radius: 16px;
+      }
+
+      .status-row {
+        gap: 10px;
+      }
+
+      .status-icon {
+        width: 44px;
+        height: 44px;
+      }
+
+      .record-area {
+        gap: 12px;
+      }
+
+      .waveform {
+        height: 90px;
+      }
+
+      .record-btn {
+        width: 112px;
+        height: 112px;
+        font-size: 14px;
+        letter-spacing: 0.12em;
+      }
+
+      .transcript {
+        min-height: 90px;
+      }
+
+      .transcript-row {
+        gap: 8px;
+      }
+
+      .transcript-row .actions button {
+        width: 88px;
+        padding: 8px 10px;
+      }
+
+      footer {
+        display: none;
+      }
+
+      body:not(.show-key) .key-panel {
+        display: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .record-btn,
+      .status-icon::after,
+      .spinner {
+        animation: none !important;
+      }
+    }
+  </style>
+</head>
+<body class="state-idle">
+  <div class="app">
+    <header>
+      <h1>STT Hotkey PWA</h1>
+      <div class="pill status-pill"><span class="spinner"></span><span id="statusText">Idle</span></div>
+    </header>
+
+    <section class="panel">
+      <div class="status-row">
+        <div class="status-left">
+          <div class="status-icon" aria-hidden="true">
+            <svg class="icon-idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="6" />
+            </svg>
+            <svg class="icon-recording" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="7" />
+              <circle cx="12" cy="12" r="2" fill="currentColor" />
+            </svg>
+            <svg class="icon-transcribing" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 12h16" />
+              <path d="M12 4v16" />
+            </svg>
+            <svg class="icon-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M5 12l4 4 10-10" />
+            </svg>
+            <svg class="icon-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="7" />
+              <path d="M12 8v5" />
+              <path d="M12 16h.01" />
+            </svg>
+          </div>
+          <div class="status-text">
+            <strong id="statusLabel">Idle</strong>
+            <span class="timer" id="timer">00:00</span>
+          </div>
+        </div>
+        <button class="pill key-toggle" id="keyIndicator" type="button" aria-expanded="true">API key: not set</button>
+      </div>
+
+      <div class="record-area">
+        <canvas class="waveform" id="waveform" width="640" height="160"></canvas>
+        <button id="recordBtn" class="record-btn" type="button">Start</button>
+        <div class="hint" id="hint">Tap to start recording.</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Transcript</h2>
+      <div class="transcript-row">
+        <textarea id="transcript" class="transcript" placeholder="Transcription will appear here." readonly></textarea>
+        <div class="actions">
+          <button id="copyBtn" class="secondary" type="button" disabled>Copy</button>
+          <button id="clearBtn" class="secondary" type="button">Clear</button>
+        </div>
+      </div>
+      <p class="muted" id="copyStatus"></p>
+    </section>
+
+    <section class="panel key-panel" id="keyPanel">
+      <h2>OpenAI API Key</h2>
+      <div class="key-row">
+        <input id="apiKey" type="password" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-..." />
+        <button id="saveKeyBtn" class="secondary" type="button">Save</button>
+        <button id="clearKeyBtn" class="secondary" type="button">Clear</button>
+      </div>
+      <p class="muted" id="keyStatus"></p>
+      <p class="muted">Key is stored only in this browser via localStorage. Do not use on shared devices.</p>
+    </section>
+
+    <footer>
+      Add to Home Screen in Safari for a full-screen app experience.
+    </footer>
+  </div>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
