@@ -12,5 +12,9 @@ let package = Package(
         .executableTarget(
             name: "stt-hotkey"
         ),
+        .testTarget(
+            name: "stt-hotkeyTests",
+            dependencies: ["stt-hotkey"]
+        ),
     ]
 )

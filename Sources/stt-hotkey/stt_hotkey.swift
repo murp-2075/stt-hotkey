@@ -10,6 +10,20 @@ private enum AppState {
     case transcribing
 }
 
+private enum CaptureMode {
+    case sttOnly
+    case sttThenRewrite
+
+    var logLabel: String {
+        switch self {
+        case .sttOnly:
+            return "stt-only"
+        case .sttThenRewrite:
+            return "stt-then-rewrite"
+        }
+    }
+}
+
 private struct HotkeyConfig {
     let keyCode: UInt32
     let modifiers: UInt32
@@ -25,20 +39,53 @@ private struct Env {
         }
 
         var values: [String: String] = [:]
-        for rawLine in contents.split(separator: "\n", omittingEmptySubsequences: false) {
+        let lines = contents.components(separatedBy: "\n")
+        var index = 0
+        while index < lines.count {
+            let rawLine = lines[index]
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix("#") {
+                index += 1
                 continue
             }
-            let parts = line.split(separator: "=", maxSplits: 1)
-            guard parts.count == 2 else { continue }
-            let key = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
-            var value = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count >= 2 {
+
+            guard let equalsIndex = rawLine.firstIndex(of: "=") else {
+                index += 1
+                continue
+            }
+
+            let key = String(rawLine[..<equalsIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            var value = String(rawLine[rawLine.index(after: equalsIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if value.hasPrefix("\"") {
+                value.removeFirst()
+                if value.hasSuffix("\"") && !value.isEmpty {
+                    value.removeLast()
+                } else {
+                    var segments = [value]
+                    index += 1
+                    while index < lines.count {
+                        var continuation = lines[index]
+                        if continuation.hasSuffix("\r") {
+                            continuation.removeLast()
+                        }
+
+                        if continuation.hasSuffix("\"") {
+                            segments.append(String(continuation.dropLast()))
+                            break
+                        } else {
+                            segments.append(continuation)
+                            index += 1
+                        }
+                    }
+                    value = segments.joined(separator: "\n")
+                }
+            } else if value.hasPrefix("'") && value.hasSuffix("'") && value.count >= 2 {
                 value.removeFirst()
                 value.removeLast()
             }
             values[key] = value
+            index += 1
         }
         return Env(values: values)
     }
@@ -46,20 +93,41 @@ private struct Env {
     func value(_ key: String) -> String? {
         values[key]
     }
+
+    func allValues() -> [String: String] {
+        values
+    }
 }
 
 @MainActor
 private final class HotkeyManager {
-    private var hotKeyRef: EventHotKeyRef?
+    private let hotkeySignature = fourCharCode("stth")
+    private var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
     private var handlerRef: EventHandlerRef?
-    private(set) var hotKeyID = EventHotKeyID(signature: 0, id: 0)
-    var onHotkey: (() -> Void)?
+    var onHotkey: ((UInt32) -> Void)?
 
-    func register(hotkey: HotkeyConfig) -> Bool {
-        hotKeyID = EventHotKeyID(signature: fourCharCode("stth"), id: 1)
-        let status = RegisterEventHotKey(hotkey.keyCode, hotkey.modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
-        if status != noErr {
-            return false
+    func register(hotkeys: [UInt32: HotkeyConfig]) -> Bool {
+        unregister()
+
+        for (hotkeyID, hotkey) in hotkeys {
+            let eventHotkeyID = EventHotKeyID(signature: hotkeySignature, id: hotkeyID)
+            var hotKeyRef: EventHotKeyRef?
+            let status = RegisterEventHotKey(
+                hotkey.keyCode,
+                hotkey.modifiers,
+                eventHotkeyID,
+                GetApplicationEventTarget(),
+                0,
+                &hotKeyRef
+            )
+            if status != noErr {
+                unregister()
+                return false
+            }
+
+            if let hotKeyRef {
+                hotKeyRefs[hotkeyID] = hotKeyRef
+            }
         }
 
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -72,15 +140,21 @@ private final class HotkeyManager {
 
         let userData = Unmanaged.passUnretained(self).toOpaque()
         let installStatus = InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, userData, &handlerRef)
-        return installStatus == noErr
+        if installStatus != noErr {
+            unregister()
+            return false
+        }
+        return true
     }
 
     func unregister() {
-        if let hotKeyRef {
+        for hotKeyRef in hotKeyRefs.values {
             UnregisterEventHotKey(hotKeyRef)
         }
+        hotKeyRefs.removeAll()
         if let handlerRef {
             RemoveEventHandler(handlerRef)
+            self.handlerRef = nil
         }
     }
 
@@ -100,9 +174,9 @@ private final class HotkeyManager {
         let capturedID = eventID
         Task { @MainActor [weak self] in
             guard let self else { return }
-            guard capturedID.signature == self.hotKeyID.signature,
-                  capturedID.id == self.hotKeyID.id else { return }
-            self.onHotkey?()
+            guard capturedID.signature == self.hotkeySignature,
+                  self.hotKeyRefs[capturedID.id] != nil else { return }
+            self.onHotkey?(capturedID.id)
         }
     }
 }
@@ -720,11 +794,19 @@ final class AppMain: NSObject, NSApplicationDelegate {
     private let hotkeyManager = HotkeyManager()
     private let fileRecorder = AudioRecorder()
     private let streamRecorder = AudioStreamRecorder()
+    private let rewriter = OpenAIRewriter()
     private var streamTranscriber: OpenAIRealtimeTranscriber?
+
+    private let sttHotkeyID: UInt32 = 1
+    private let rewriteHotkeyID: UInt32 = 2
 
     private var env = Env(values: [:])
     private var apiKey: String?
     private var useRealtimeTranscription = false
+    private var rewriteConfig = RewriteConfig(model: "gpt-5.2", prompt: nil, reasoningEffort: nil, verbosity: nil, fallbackToRaw: true)
+    private var startupConfigurationError: String?
+    private var pendingCaptureMode: CaptureMode = .sttOnly
+    private var activeCaptureMode: CaptureMode = .sttOnly
     private var startSound: NSSound?
     private var state: AppState = .idle {
         didSet { updateStatusIcon() }
@@ -747,7 +829,13 @@ final class AppMain: NSObject, NSApplicationDelegate {
         cleanupStaleTempFiles()
         setupStatusItem()
         setupStartSound()
-        setupHotkey()
+        if let startupConfigurationError {
+            log("stt-hotkey: configuration error - \(startupConfigurationError)")
+            showAlert(title: "Configuration Error", message: startupConfigurationError)
+            NSApplication.shared.terminate(nil)
+            return
+        }
+        setupHotkeys()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -769,7 +857,13 @@ final class AppMain: NSObject, NSApplicationDelegate {
             ?? env.value("Realtime_Transcription")
             ?? env.value("Realtime Transcription")
         useRealtimeTranscription = parseBoolFlag(realtimeFlag)
+        do {
+            rewriteConfig = try RewriteConfig.fromEnvValues(env.allValues())
+        } catch {
+            startupConfigurationError = error.localizedDescription
+        }
         log("stt-hotkey: realtime transcription \(useRealtimeTranscription ? "enabled" : "disabled")")
+        log("stt-hotkey: rewrite model \(rewriteConfig.model)")
     }
 
     private func cleanupStaleTempFiles() {
@@ -799,24 +893,39 @@ final class AppMain: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    private func setupHotkey() {
-        let defaultHotkey = HotkeyConfig(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(cmdKey | shiftKey))
-        let config = parseHotkey(from: env.value("HOTKEY")) ?? defaultHotkey
-        hotkeyManager.onHotkey = { [weak self] in
-            self?.toggleRecording()
+    private func setupHotkeys() {
+        let defaultSTTHotkey = HotkeyConfig(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(cmdKey | shiftKey))
+        let defaultRewriteHotkey = HotkeyConfig(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(cmdKey | shiftKey))
+        let sttHotkey = parseHotkey(from: env.value("HOTKEY")) ?? defaultSTTHotkey
+        let rewriteHotkey = parseHotkey(from: env.value("REWRITE_HOTKEY")) ?? defaultRewriteHotkey
+
+        hotkeyManager.onHotkey = { [weak self] hotkeyID in
+            guard let self else { return }
+            let mode: CaptureMode = hotkeyID == self.rewriteHotkeyID ? .sttThenRewrite : .sttOnly
+            self.handleCaptureHotkey(mode)
         }
-        let ok = hotkeyManager.register(hotkey: config)
+
+        let ok = hotkeyManager.register(hotkeys: [
+            sttHotkeyID: sttHotkey,
+            rewriteHotkeyID: rewriteHotkey
+        ])
         if !ok {
-            log("stt-hotkey: failed to register hotkey")
-            showAlert(title: "Hotkey Error", message: "Failed to register global hotkey.")
+            log("stt-hotkey: failed to register one or more hotkeys")
+            showAlert(title: "Hotkey Error", message: "Failed to register global hotkeys.")
         } else {
-            log("stt-hotkey: hotkey registered")
+            log("stt-hotkey: hotkeys registered")
         }
     }
 
     @objc private func toggleRecording() {
+        handleCaptureHotkey(.sttOnly)
+    }
+
+    private func handleCaptureHotkey(_ mode: CaptureMode) {
+        log("stt-hotkey: hotkey trigger \(mode.logLabel)")
         switch state {
         case .idle:
+            pendingCaptureMode = mode
             requestMicPermissionAndStart()
         case .starting:
             cancelPendingStart()
@@ -867,6 +976,8 @@ final class AppMain: NSObject, NSApplicationDelegate {
             state = .idle
             return
         }
+        activeCaptureMode = pendingCaptureMode
+        log("stt-hotkey: capture mode \(activeCaptureMode.logLabel)")
 
         if useRealtimeTranscription {
             log("stt-hotkey: mode = realtime")
@@ -894,16 +1005,13 @@ final class AppMain: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.streamRecorder.stop()
             self.streamTranscriber = nil
-            self.state = .idle
             switch result {
             case .success(let text):
-                log("stt-hotkey: transcription success")
-                self.copyToClipboard(text)
-                self.playDing()
-                self.blinkIcon()
+                self.handleTranscriptionSuccess(text)
             case .failure(let error):
                 log("stt-hotkey: transcription error - \(error.localizedDescription)")
                 self.showAlert(title: "Transcription Error", message: error.localizedDescription)
+                self.state = .idle
             }
         })
         transcriber.beginInput()
@@ -975,19 +1083,84 @@ final class AppMain: NSObject, NSApplicationDelegate {
             // No UI updates needed for deltas yet.
         }, completion: { [weak self] result in
             guard let self else { return }
-            self.state = .idle
             switch result {
             case .success(let text):
-                log("stt-hotkey: transcription success")
-                self.copyToClipboard(text)
-                self.playDing()
-                self.blinkIcon()
+                self.handleTranscriptionSuccess(text)
             case .failure(let error):
                 log("stt-hotkey: transcription error - \(error.localizedDescription)")
                 self.showAlert(title: "Transcription Error", message: error.localizedDescription)
+                self.state = .idle
             }
             try? FileManager.default.removeItem(at: fileURL)
         })
+    }
+
+    private func handleTranscriptionSuccess(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            log("stt-hotkey: transcription returned empty text; skipping clipboard update")
+            state = .idle
+            return
+        }
+
+        switch activeCaptureMode {
+        case .sttOnly:
+            log("stt-hotkey: transcription success (stt-only)")
+            copyToClipboard(text)
+            playDing()
+            blinkIcon()
+            state = .idle
+        case .sttThenRewrite:
+            log("stt-hotkey: transcription success; starting rewrite with model \(rewriteConfig.model)")
+            rewriteTranscript(text)
+        }
+    }
+
+    private func rewriteTranscript(_ transcript: String) {
+        guard let apiKey else {
+            showAlert(title: "Missing API Key", message: "Set OPENAI_API_KEY in the .env next to the executable.")
+            state = .idle
+            return
+        }
+
+        guard rewriteConfig.prompt != nil else {
+            handleRewriteFailure(RewriteSupportError.missingPrompt, rawTranscript: transcript)
+            state = .idle
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let rewritten = try await self.rewriter.rewrite(text: transcript, apiKey: apiKey, config: self.rewriteConfig)
+                let trimmed = rewritten.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else {
+                    self.handleRewriteFailure(RewriteSupportError.emptyResponse, rawTranscript: transcript)
+                    self.state = .idle
+                    return
+                }
+                log("stt-hotkey: rewrite success")
+                self.copyToClipboard(rewritten)
+                self.playDing()
+                self.blinkIcon()
+                self.state = .idle
+            } catch {
+                self.handleRewriteFailure(error, rawTranscript: transcript)
+                self.state = .idle
+            }
+        }
+    }
+
+    private func handleRewriteFailure(_ error: Error, rawTranscript: String) {
+        log("stt-hotkey: rewrite error - \(error.localizedDescription)")
+        if rewriteConfig.fallbackToRaw {
+            log("stt-hotkey: rewrite fallback to raw transcript")
+            copyToClipboard(rawTranscript)
+            playDing()
+            blinkIcon()
+        } else {
+            showAlert(title: "Rewrite Error", message: error.localizedDescription)
+        }
     }
 
     private func updateStatusIcon() {
