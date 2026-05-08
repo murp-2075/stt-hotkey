@@ -3,25 +3,13 @@ import AVFoundation
 import Carbon
 import Foundation
 
+let openAITranscriptionModel = "gpt-4o-mini-transcribe"
+
 private enum AppState {
     case idle
     case starting
     case recording
     case transcribing
-}
-
-private enum CaptureMode {
-    case sttOnly
-    case sttThenRewrite
-
-    var logLabel: String {
-        switch self {
-        case .sttOnly:
-            return "stt-only"
-        case .sttThenRewrite:
-            return "stt-then-rewrite"
-        }
-    }
 }
 
 private struct HotkeyConfig {
@@ -238,105 +226,6 @@ private final class AudioRecorder: NSObject, @unchecked Sendable {
     }
 }
 
-private final class AudioStreamRecorder: NSObject, @unchecked Sendable {
-    private let engine = AVAudioEngine()
-    private let outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: true)!
-    private var inputFormat: AVAudioFormat?
-    private var converter: AVAudioConverter?
-    private var didFireStart = false
-    private var onFirstBuffer: (() -> Void)?
-    private var onAudioData: ((Data) -> Void)?
-
-    func start(onFirstBuffer: @escaping () -> Void, onAudioData: @escaping (Data) -> Void) throws {
-        stop()
-        didFireStart = false
-        self.onFirstBuffer = onFirstBuffer
-        self.onAudioData = onAudioData
-
-        let input = engine.inputNode
-        let inputFormat = input.inputFormat(forBus: 0)
-        guard inputFormat.channelCount > 0 else {
-            throw NSError(domain: "AudioStreamRecorder", code: 2, userInfo: [NSLocalizedDescriptionKey: "No input channels available."])
-        }
-
-        self.inputFormat = inputFormat
-        converter = AVAudioConverter(from: inputFormat, to: outputFormat)
-
-        input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            guard let self else { return }
-
-            guard let pcmData = self.convertToPCM(buffer) else { return }
-            self.onAudioData?(pcmData)
-            if !self.didFireStart {
-                self.didFireStart = true
-                let onFirst = self.onFirstBuffer
-                DispatchQueue.main.async {
-                    onFirst?()
-                }
-            }
-        }
-
-        engine.prepare()
-        try engine.start()
-    }
-
-    func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        converter = nil
-        inputFormat = nil
-        onFirstBuffer = nil
-        onAudioData = nil
-        didFireStart = false
-    }
-
-    private func convertToPCM(_ buffer: AVAudioPCMBuffer) -> Data? {
-        guard let converter, let inputFormat else { return nil }
-        let ratio = outputFormat.sampleRate / inputFormat.sampleRate
-        let outputFrameCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1
-        guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputFrameCapacity) else {
-            return nil
-        }
-
-        final class ConverterState: @unchecked Sendable {
-            var didProvideInput = false
-            let buffer: AVAudioPCMBuffer
-
-            init(buffer: AVAudioPCMBuffer) {
-                self.buffer = buffer
-            }
-        }
-
-        let state = ConverterState(buffer: buffer)
-        var error: NSError?
-        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
-            if state.didProvideInput {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-            state.didProvideInput = true
-            outStatus.pointee = .haveData
-            return state.buffer
-        }
-
-        converter.convert(to: convertedBuffer, error: &error, withInputFrom: inputBlock)
-        if error != nil || convertedBuffer.frameLength == 0 {
-            return nil
-        }
-
-        if let channelData = convertedBuffer.int16ChannelData {
-            let bytesPerFrame = Int(convertedBuffer.format.streamDescription.pointee.mBytesPerFrame)
-            let byteCount = Int(convertedBuffer.frameLength) * bytesPerFrame
-            return Data(bytes: channelData.pointee, count: byteCount)
-        }
-
-        let audioBuffer = convertedBuffer.audioBufferList.pointee.mBuffers
-        guard let mData = audioBuffer.mData else { return nil }
-        return Data(bytes: mData, count: Int(audioBuffer.mDataByteSize))
-    }
-}
-
 private final class OpenAITranscriber: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private struct StreamEvent: Decodable {
         let type: String
@@ -399,7 +288,7 @@ private final class OpenAITranscriber: NSObject, URLSessionDataDelegate, @unchec
             body.append("\r\n")
         }
 
-        appendField(name: "model", value: "gpt-4o-mini-transcribe")
+        appendField(name: "model", value: openAITranscriptionModel)
         appendField(name: "stream", value: "true")
         appendField(name: "response_format", value: "json")
         appendFile(name: "file", filename: fileURL.lastPathComponent, mimeType: "audio/wav", fileURL: fileURL)
@@ -487,326 +376,16 @@ private final class OpenAITranscriber: NSObject, URLSessionDataDelegate, @unchec
     }
 }
 
-private final class OpenAIRealtimeTranscriber: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
-    enum RealtimeError: LocalizedError {
-        case connectionClosed
-        case serverError(String)
-        case transcriptionFailed(String)
-        case noText
-
-        var errorDescription: String? {
-            switch self {
-            case .connectionClosed:
-                return "Realtime connection closed."
-            case .serverError(let message):
-                return message
-            case .transcriptionFailed(let message):
-                return message
-            case .noText:
-                return "No transcription text received."
-            }
-        }
-    }
-
-    private let stateQueue = DispatchQueue(label: "stt-hotkey.realtime.state")
-    private var session: URLSession?
-    private var webSocket: URLSessionWebSocketTask?
-    private var isConfigured = false
-    private var pendingAudio: [Data] = []
-    private var pendingClear = false
-    private var pendingCommit = false
-    private var isAcceptingAudio = false
-    private var currentItemID: String?
-    private var fullText = ""
-    private var onDelta: ((String) -> Void)?
-    private var completion: ((Result<String, Error>) -> Void)?
-    private var didFinish = false
-
-    private let realtimeModel: String
-    private let transcriptionModel: String
-
-    init(realtimeModel: String = "gpt-realtime-mini", transcriptionModel: String = "gpt-4o-mini-transcribe") {
-        self.realtimeModel = realtimeModel
-        self.transcriptionModel = transcriptionModel
-        super.init()
-    }
-
-    func start(apiKey: String, onDelta: @escaping (String) -> Void, completion: @escaping (Result<String, Error>) -> Void) {
-        self.onDelta = onDelta
-        self.completion = completion
-        fullText = ""
-        currentItemID = nil
-        isConfigured = false
-        pendingAudio.removeAll()
-        pendingClear = false
-        pendingCommit = false
-        isAcceptingAudio = false
-
-        guard let url = URL(string: "wss://api.openai.com/v1/realtime?model=\(realtimeModel)") else {
-            finish(with: .failure(RealtimeError.serverError("Invalid realtime URL.")))
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-        self.session = session
-        let task = session.webSocketTask(with: request)
-        self.webSocket = task
-        task.resume()
-        receiveLoop()
-    }
-
-    func beginInput() {
-        stateQueue.async { [weak self] in
-            guard let self else { return }
-            self.fullText = ""
-            self.currentItemID = nil
-            self.isAcceptingAudio = true
-            if self.isConfigured {
-                self.sendClear()
-            } else {
-                self.pendingClear = true
-            }
-        }
-    }
-
-    func sendAudio(_ data: Data) {
-        stateQueue.async { [weak self] in
-            guard let self else { return }
-            guard self.isAcceptingAudio else { return }
-            if self.isConfigured {
-                self.sendAudioAppend(data)
-            } else {
-                self.pendingAudio.append(data)
-            }
-        }
-    }
-
-    func commit() {
-        stateQueue.async { [weak self] in
-            guard let self else { return }
-            self.isAcceptingAudio = false
-            if self.isConfigured {
-                self.sendCommit()
-            } else {
-                self.pendingCommit = true
-            }
-        }
-    }
-
-    func cancel() {
-        finish(with: .failure(RealtimeError.connectionClosed))
-    }
-
-    func shutdown() {
-        stateQueue.async { [weak self] in
-            guard let self else { return }
-            guard !self.didFinish else { return }
-            self.didFinish = true
-            self.completion = nil
-            self.onDelta = nil
-            DispatchQueue.main.async { [weak self] in
-                self?.webSocket?.cancel(with: .goingAway, reason: nil)
-                self?.session?.invalidateAndCancel()
-                self?.webSocket = nil
-                self?.session = nil
-            }
-        }
-    }
-
-    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        sendSessionUpdate()
-    }
-
-    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        finish(with: .failure(RealtimeError.connectionClosed))
-    }
-
-    private func receiveLoop() {
-        webSocket?.receive { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                self.finish(with: .failure(error))
-            case .success(let message):
-                switch message {
-                case .string(let text):
-                    if let data = text.data(using: .utf8) {
-                        self.handleServerEvent(data)
-                    }
-                case .data(let data):
-                    self.handleServerEvent(data)
-                @unknown default:
-                    break
-                }
-                self.receiveLoop()
-            }
-        }
-    }
-
-    private func sendSessionUpdate() {
-        let payload: [String: Any] = [
-            "type": "session.update",
-            "session": [
-                "type": "realtime",
-                "audio": [
-                    "input": [
-                        "format": [
-                            "type": "audio/pcm",
-                            "rate": 24000
-                        ],
-                        "transcription": [
-                            "model": transcriptionModel
-                        ],
-                        "turn_detection": NSNull()
-                    ]
-                ]
-            ]
-        ]
-        sendEvent(payload)
-    }
-
-    private func handleServerEvent(_ data: Data) {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = object["type"] as? String else { return }
-
-        switch type {
-        case "session.updated":
-            stateQueue.async { [weak self] in
-                guard let self else { return }
-                self.isConfigured = true
-                if self.pendingClear {
-                    self.sendClear()
-                    self.pendingClear = false
-                }
-                if !self.pendingAudio.isEmpty {
-                    let queued = self.pendingAudio
-                    self.pendingAudio.removeAll()
-                    queued.forEach { self.sendAudioAppend($0) }
-                }
-                if self.pendingCommit {
-                    self.sendCommit()
-                    self.pendingCommit = false
-                }
-            }
-        case "input_audio_buffer.committed":
-            if let itemID = object["item_id"] as? String {
-                stateQueue.async { [weak self] in
-                    self?.currentItemID = itemID
-                }
-            }
-        case "conversation.item.input_audio_transcription.delta":
-            guard let itemID = object["item_id"] as? String,
-                  let delta = object["delta"] as? String else { return }
-            stateQueue.async { [weak self] in
-                guard let self else { return }
-                if self.currentItemID == nil {
-                    self.currentItemID = itemID
-                }
-                guard self.currentItemID == itemID else { return }
-                self.fullText += delta
-                DispatchQueue.main.async { [weak self] in
-                    self?.onDelta?(delta)
-                }
-            }
-        case "conversation.item.input_audio_transcription.completed":
-            guard let itemID = object["item_id"] as? String else { return }
-            let transcript = object["transcript"] as? String
-            stateQueue.async { [weak self] in
-                guard let self else { return }
-                if self.currentItemID == nil {
-                    self.currentItemID = itemID
-                }
-                guard self.currentItemID == itemID else { return }
-                if let transcript, !transcript.isEmpty {
-                    self.fullText = transcript
-                }
-                let resultText = self.fullText
-                if resultText.isEmpty {
-                    self.finish(with: .failure(RealtimeError.noText))
-                } else {
-                    self.finish(with: .success(resultText))
-                }
-            }
-        case "conversation.item.input_audio_transcription.failed":
-            let message = (object["error"] as? [String: Any])?["message"] as? String ?? "Transcription failed."
-            finish(with: .failure(RealtimeError.transcriptionFailed(message)))
-        case "error":
-            let message = (object["error"] as? [String: Any])?["message"] as? String ?? "Realtime API error."
-            finish(with: .failure(RealtimeError.serverError(message)))
-        default:
-            break
-        }
-    }
-
-    private func sendAudioAppend(_ data: Data) {
-        let payload: [String: Any] = [
-            "type": "input_audio_buffer.append",
-            "audio": data.base64EncodedString()
-        ]
-        sendEvent(payload)
-    }
-
-    private func sendClear() {
-        sendEvent(["type": "input_audio_buffer.clear"])
-    }
-
-    private func sendCommit() {
-        sendEvent(["type": "input_audio_buffer.commit"])
-    }
-
-    private func sendEvent(_ payload: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let text = String(data: data, encoding: .utf8) else { return }
-        webSocket?.send(.string(text)) { [weak self] error in
-            if let error {
-                self?.finish(with: .failure(error))
-            }
-        }
-    }
-
-    private func finish(with result: Result<String, Error>) {
-        stateQueue.async { [weak self] in
-            guard let self else { return }
-            guard !self.didFinish else { return }
-            self.didFinish = true
-
-            let completion = self.completion
-            self.completion = nil
-            self.onDelta = nil
-
-            DispatchQueue.main.async { [weak self] in
-                completion?(result)
-                self?.webSocket?.cancel(with: .normalClosure, reason: nil)
-                self?.session?.invalidateAndCancel()
-                self?.webSocket = nil
-                self?.session = nil
-            }
-        }
-    }
-}
-
 @MainActor
 final class AppMain: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let hotkeyManager = HotkeyManager()
     private let fileRecorder = AudioRecorder()
-    private let streamRecorder = AudioStreamRecorder()
-    private let rewriter = OpenAIRewriter()
-    private var streamTranscriber: OpenAIRealtimeTranscriber?
 
     private let sttHotkeyID: UInt32 = 1
-    private let rewriteHotkeyID: UInt32 = 2
 
     private var env = Env(values: [:])
     private var apiKey: String?
-    private var useRealtimeTranscription = false
-    private var rewriteConfig = RewriteConfig(model: "gpt-5.2", prompt: nil, reasoningEffort: nil, verbosity: nil, fallbackToRaw: true)
-    private var startupConfigurationError: String?
-    private var pendingCaptureMode: CaptureMode = .sttOnly
-    private var activeCaptureMode: CaptureMode = .sttOnly
     private var startSound: NSSound?
     private var state: AppState = .idle {
         didSet { updateStatusIcon() }
@@ -829,18 +408,11 @@ final class AppMain: NSObject, NSApplicationDelegate {
         cleanupStaleTempFiles()
         setupStatusItem()
         setupStartSound()
-        if let startupConfigurationError {
-            log("stt-hotkey: configuration error - \(startupConfigurationError)")
-            showAlert(title: "Configuration Error", message: startupConfigurationError)
-            NSApplication.shared.terminate(nil)
-            return
-        }
         setupHotkeys()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         hotkeyManager.unregister()
-        streamTranscriber?.shutdown()
     }
 
     private func setupEnv() {
@@ -853,17 +425,7 @@ final class AppMain: NSObject, NSApplicationDelegate {
             env = Env.load(from: cwdEnvURL)
         }
         apiKey = env.value("OPENAI_API_KEY")
-        let realtimeFlag = env.value("REALTIME_TRANSCRIPTION")
-            ?? env.value("Realtime_Transcription")
-            ?? env.value("Realtime Transcription")
-        useRealtimeTranscription = parseBoolFlag(realtimeFlag)
-        do {
-            rewriteConfig = try RewriteConfig.fromEnvValues(env.allValues())
-        } catch {
-            startupConfigurationError = error.localizedDescription
-        }
-        log("stt-hotkey: realtime transcription \(useRealtimeTranscription ? "enabled" : "disabled")")
-        log("stt-hotkey: rewrite model \(rewriteConfig.model)")
+        log("stt-hotkey: transcription model \(openAITranscriptionModel)")
     }
 
     private func cleanupStaleTempFiles() {
@@ -895,19 +457,15 @@ final class AppMain: NSObject, NSApplicationDelegate {
 
     private func setupHotkeys() {
         let defaultSTTHotkey = HotkeyConfig(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(cmdKey | shiftKey))
-        let defaultRewriteHotkey = HotkeyConfig(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(cmdKey | shiftKey))
         let sttHotkey = parseHotkey(from: env.value("HOTKEY")) ?? defaultSTTHotkey
-        let rewriteHotkey = parseHotkey(from: env.value("REWRITE_HOTKEY")) ?? defaultRewriteHotkey
 
-        hotkeyManager.onHotkey = { [weak self] hotkeyID in
+        hotkeyManager.onHotkey = { [weak self] _ in
             guard let self else { return }
-            let mode: CaptureMode = hotkeyID == self.rewriteHotkeyID ? .sttThenRewrite : .sttOnly
-            self.handleCaptureHotkey(mode)
+            self.handleCaptureHotkey()
         }
 
         let ok = hotkeyManager.register(hotkeys: [
-            sttHotkeyID: sttHotkey,
-            rewriteHotkeyID: rewriteHotkey
+            sttHotkeyID: sttHotkey
         ])
         if !ok {
             log("stt-hotkey: failed to register one or more hotkeys")
@@ -918,14 +476,13 @@ final class AppMain: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleRecording() {
-        handleCaptureHotkey(.sttOnly)
+        handleCaptureHotkey()
     }
 
-    private func handleCaptureHotkey(_ mode: CaptureMode) {
-        log("stt-hotkey: hotkey trigger \(mode.logLabel)")
+    private func handleCaptureHotkey() {
+        log("stt-hotkey: hotkey trigger stt-only")
         switch state {
         case .idle:
-            pendingCaptureMode = mode
             requestMicPermissionAndStart()
         case .starting:
             cancelPendingStart()
@@ -971,80 +528,17 @@ final class AppMain: NSObject, NSApplicationDelegate {
     }
 
     private func startRecording() {
-        guard let apiKey else {
+        guard apiKey?.isEmpty == false else {
             showAlert(title: "Missing API Key", message: "Set OPENAI_API_KEY in the .env next to the executable.")
             state = .idle
             return
         }
-        activeCaptureMode = pendingCaptureMode
-        log("stt-hotkey: capture mode \(activeCaptureMode.logLabel)")
-
-        if useRealtimeTranscription {
-            log("stt-hotkey: mode = realtime")
-            startRealtimeRecording(apiKey: apiKey)
-        } else {
-            log("stt-hotkey: mode = legacy")
-            startLegacyRecording()
-        }
+        log("stt-hotkey: mode = \(openAITranscriptionModel)")
+        startLegacyRecording()
     }
 
     private func stopRecordingAndTranscribe() {
-        if useRealtimeTranscription {
-            stopRealtimeRecordingAndTranscribe()
-        } else {
-            stopLegacyRecordingAndTranscribe()
-        }
-    }
-
-    private func startRealtimeRecording(apiKey: String) {
-        let transcriber = OpenAIRealtimeTranscriber()
-        streamTranscriber = transcriber
-        transcriber.start(apiKey: apiKey, onDelta: { _ in
-            // No UI updates needed for deltas yet.
-        }, completion: { [weak self] result in
-            guard let self else { return }
-            self.streamRecorder.stop()
-            self.streamTranscriber = nil
-            switch result {
-            case .success(let text):
-                self.handleTranscriptionSuccess(text)
-            case .failure(let error):
-                log("stt-hotkey: transcription error - \(error.localizedDescription)")
-                self.showAlert(title: "Transcription Error", message: error.localizedDescription)
-                self.state = .idle
-            }
-        })
-        transcriber.beginInput()
-
-        do {
-            try streamRecorder.start(onFirstBuffer: { [weak self] in
-                self?.playRecordingStartDing()
-            }, onAudioData: { [weak self] data in
-                self?.streamTranscriber?.sendAudio(data)
-            })
-            state = .recording
-            log("stt-hotkey: recording started (realtime)")
-        } catch {
-            log("stt-hotkey: recording error - \(error.localizedDescription)")
-            showAlert(title: "Recording Error", message: error.localizedDescription)
-            transcriber.shutdown()
-            streamTranscriber = nil
-            state = .idle
-        }
-    }
-
-    private func stopRealtimeRecordingAndTranscribe() {
-        streamRecorder.stop()
-        log("stt-hotkey: recording stopped (realtime)")
-        state = .transcribing
-
-        guard let transcriber = streamTranscriber else {
-            showAlert(title: "Transcription Error", message: "Realtime transcription session not available.")
-            state = .idle
-            return
-        }
-
-        transcriber.commit()
+        stopLegacyRecordingAndTranscribe()
     }
 
     private func startLegacyRecording() {
@@ -1103,64 +597,11 @@ final class AppMain: NSObject, NSApplicationDelegate {
             return
         }
 
-        switch activeCaptureMode {
-        case .sttOnly:
-            log("stt-hotkey: transcription success (stt-only)")
-            copyToClipboard(text)
-            playDing()
-            blinkIcon()
-            state = .idle
-        case .sttThenRewrite:
-            log("stt-hotkey: transcription success; starting rewrite with model \(rewriteConfig.model)")
-            rewriteTranscript(text)
-        }
-    }
-
-    private func rewriteTranscript(_ transcript: String) {
-        guard let apiKey else {
-            showAlert(title: "Missing API Key", message: "Set OPENAI_API_KEY in the .env next to the executable.")
-            state = .idle
-            return
-        }
-
-        guard rewriteConfig.prompt != nil else {
-            handleRewriteFailure(RewriteSupportError.missingPrompt, rawTranscript: transcript)
-            state = .idle
-            return
-        }
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let rewritten = try await self.rewriter.rewrite(text: transcript, apiKey: apiKey, config: self.rewriteConfig)
-                let trimmed = rewritten.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else {
-                    self.handleRewriteFailure(RewriteSupportError.emptyResponse, rawTranscript: transcript)
-                    self.state = .idle
-                    return
-                }
-                log("stt-hotkey: rewrite success")
-                self.copyToClipboard(rewritten)
-                self.playDing()
-                self.blinkIcon()
-                self.state = .idle
-            } catch {
-                self.handleRewriteFailure(error, rawTranscript: transcript)
-                self.state = .idle
-            }
-        }
-    }
-
-    private func handleRewriteFailure(_ error: Error, rawTranscript: String) {
-        log("stt-hotkey: rewrite error - \(error.localizedDescription)")
-        if rewriteConfig.fallbackToRaw {
-            log("stt-hotkey: rewrite fallback to raw transcript")
-            copyToClipboard(rawTranscript)
-            playDing()
-            blinkIcon()
-        } else {
-            showAlert(title: "Rewrite Error", message: error.localizedDescription)
-        }
+        log("stt-hotkey: transcription success")
+        copyToClipboard(text)
+        playDing()
+        blinkIcon()
+        state = .idle
     }
 
     private func updateStatusIcon() {
@@ -1241,13 +682,6 @@ final class AppMain: NSObject, NSApplicationDelegate {
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
         alert.runModal()
-    }
-
-    private func parseBoolFlag(_ raw: String?) -> Bool {
-        guard let raw else { return false }
-        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized.isEmpty { return false }
-        return ["1", "true", "yes", "y", "on"].contains(normalized)
     }
 
     private func parseHotkey(from raw: String?) -> HotkeyConfig? {
