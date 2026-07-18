@@ -9,6 +9,7 @@ Environment variables:
 - `OPENAI_API_KEY` (required)
 - `HOTKEY` (optional, default `cmd+shift+s`)
 - `SHOW_DOCK_ICON` (optional)
+- `SCREEN_SHARING_CLIPBOARD_NUDGE` (optional, default enabled; set to `0` to disable the same-Space focus bounce after transcribing from Screen Sharing)
 
 Build
 ```

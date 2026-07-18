@@ -599,6 +599,7 @@ final class AppMain: NSObject, NSApplicationDelegate {
 
         log("stt-hotkey: transcription success")
         copyToClipboard(text)
+        nudgeScreenSharingClipboardSync()
         playDing()
         blinkIcon()
         state = .idle
@@ -674,6 +675,27 @@ final class AppMain: NSObject, NSApplicationDelegate {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+    }
+
+    private func nudgeScreenSharingClipboardSync() {
+        guard env.value("SCREEN_SHARING_CLIPBOARD_NUDGE") != "0",
+              let frontmostApplication = NSWorkspace.shared.frontmostApplication,
+              frontmostApplication.bundleIdentifier == "com.apple.ScreenSharing" else {
+            return
+        }
+
+        log("stt-hotkey: nudging Screen Sharing clipboard with a same-Space focus bounce")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == NSRunningApplication.current.processIdentifier else {
+                log("stt-hotkey: skipped Screen Sharing focus restore; focus changed during nudge")
+                return
+            }
+
+            let activated = frontmostApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            log("stt-hotkey: Screen Sharing focus restore \(activated ? "requested" : "failed")")
+        }
     }
 
     private func showAlert(title: String, message: String) {
