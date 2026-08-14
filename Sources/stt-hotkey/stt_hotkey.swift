@@ -3,7 +3,7 @@ import AVFoundation
 import Carbon
 import Foundation
 
-let openAITranscriptionModel = "gpt-4o-mini-transcribe"
+let openAITranscriptionModel = "gpt-transcribe"
 
 private enum AppState {
     case idle

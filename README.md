@@ -3,7 +3,7 @@
 One global hotkey:
 - `cmd+shift+s` (or `HOTKEY`) for speech-to-text.
 
-Speech-to-text uses OpenAI audio transcriptions with `gpt-4o-mini-transcribe`.
+Speech-to-text uses OpenAI audio transcriptions with `gpt-transcribe`.
 
 Environment variables:
 - `OPENAI_API_KEY` (required)
